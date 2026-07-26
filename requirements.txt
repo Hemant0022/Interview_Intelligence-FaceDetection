@@ -1,0 +1,14 @@
+opencv-contrib-python
+numpy
+torch
+torchvision
+transformers
+pillow
+insightface
+onnxruntime
+ultralytics
+py-feat
+pandas
+numpy
+mediapipe==0.10.21
+streamlit
