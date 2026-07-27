@@ -76,6 +76,22 @@ DETECT_EVERY_N_FRAMES = 8    # re-run YuNet face detection every N frames, reuse
 YOLO_EVERY_N_FRAMES = 8      # re-run YOLO object detection every N frames, reuse results in between
 DRAW_LANDMARKS = False       # draw the 468 FaceMesh dots on the frame (adds per-frame cost + visual clutter)
 
+# Head-pose direction thresholds (degrees). This head-pose estimate uses
+# only 6 sparse landmark points with no per-person calibration, so pitch
+# in particular is noisy — a normal desk glance-down may not produce a
+# large angle. If "Down" still doesn't trigger after lowering this, turn
+# on the sidebar debug toggle in app.py, watch the raw pitch value while
+# looking down, and set PITCH_DOWN_THRESHOLD just below what you see
+# (also check the sign isn't flipped — if pitch goes very NEGATIVE when
+# you look down instead of positive, swap the comparison signs below).
+YAW_THRESHOLD = 18
+PITCH_UP_THRESHOLD = -15
+PITCH_DOWN_THRESHOLD = 10  # lowered from 18 — was likely too strict to ever trigger
+
+# Also worth knowing: since yaw is checked before pitch, a head tilt that
+# combines a downward glance with any sideways turn beyond YAW_THRESHOLD
+# will be classified as Left/Right instead of Down.
+
 print("[INFO] Loading YuNet face detector...")
 face_detector = cv2.FaceDetectorYN.create(
     model=YUNET_MODEL_PATH,
@@ -143,8 +159,37 @@ _state = {
     "frame_count": 0,
     "last_faces": [],
     "last_yolo_detections": [],  # cached YOLO results, refreshed every YOLO_EVERY_N_FRAMES
+    "last_face_box": None,       # [x, y, x2, y2] of the last successfully detected face
+    "last_face_seen_time": 0.0,
     "prev_time": time.time(),
 }
+
+# How long to keep trusting the last known face position after detection
+# fails, for occlusion checks. A book/phone fully covering the face makes
+# YuNet fail to find a face at all — the exact case object-on-face is
+# supposed to catch — so we can't rely on a *current* face box in that
+# situation. We use the last known position instead, for a short window.
+FACE_MEMORY_SECONDS = 3.0
+
+
+def _check_object_overlap(detected_objects, face_box):
+    """Returns (object_on_face, object_on_eyes) by checking detected YOLO
+    boxes (excluding 'person') against the face box and its upper half."""
+    fx, fy, fx2, fy2 = face_box
+    eyes_box = [fx, fy, fx2, fy + int((fy2 - fy) * 0.5)]
+
+    on_face = False
+    on_eyes = False
+
+    for obj in detected_objects:
+        if obj["class"] == "person":
+            continue
+        if boxes_overlap(obj["bbox"], face_box):
+            on_face = True
+        if boxes_overlap(obj["bbox"], eyes_box):
+            on_eyes = True
+
+    return on_face, on_eyes
 
 
 def _empty_analysis():
@@ -291,6 +336,17 @@ def process_frame(frame):
 
     if len(last_faces) == 0:
         analysis["behavior"]["face_missing"] = True
+
+        # No face detected right now — likely occluded rather than absent
+        # if we saw one recently. Check the cached position for occlusion.
+        if _state["last_face_box"] is not None and \
+                (time.time() - _state["last_face_seen_time"]) <= FACE_MEMORY_SECONDS:
+            on_face, on_eyes = _check_object_overlap(
+                analysis["objects"]["detected"], _state["last_face_box"]
+            )
+            analysis["objects"]["object_on_face"] = on_face
+            analysis["objects"]["object_on_eyes"] = on_eyes
+
         current_time = time.time()
         fps = 1 / max(current_time - _state["prev_time"], 1e-6)
         _state["prev_time"] = current_time
@@ -311,6 +367,15 @@ def process_frame(frame):
 
     if face_crop.size == 0:
         analysis["behavior"]["face_missing"] = True
+
+        if _state["last_face_box"] is not None and \
+                (time.time() - _state["last_face_seen_time"]) <= FACE_MEMORY_SECONDS:
+            on_face, on_eyes = _check_object_overlap(
+                analysis["objects"]["detected"], _state["last_face_box"]
+            )
+            analysis["objects"]["object_on_face"] = on_face
+            analysis["objects"]["object_on_eyes"] = on_eyes
+
         current_time = time.time()
         fps = 1 / max(current_time - _state["prev_time"], 1e-6)
         _state["prev_time"] = current_time
@@ -318,6 +383,11 @@ def process_frame(frame):
         return frame, analysis
 
     analysis["behavior"]["face_missing"] = False
+
+    # Remember this face's position for occlusion checks on future frames
+    # where detection fails (e.g. face fully covered by a book/phone).
+    _state["last_face_box"] = [x, y, x2, y2]
+    _state["last_face_seen_time"] = time.time()
 
     # ---------------- Face quality ----------------
     lighting, brightness = check_brightness(face_crop)
@@ -339,16 +409,9 @@ def process_frame(frame):
     })
 
     # ---------------- object-on-face / object-on-eyes heuristic ----------------
-    face_box = [x, y, x2, y2]
-    eyes_box = [x, y, x2, y + int((y2 - y) * 0.5)]  # upper half of the face
-
-    for obj in analysis["objects"]["detected"]:
-        if obj["class"] in ("person",):
-            continue
-        if boxes_overlap(obj["bbox"], face_box):
-            analysis["objects"]["object_on_face"] = True
-        if boxes_overlap(obj["bbox"], eyes_box):
-            analysis["objects"]["object_on_eyes"] = True
+    on_face, on_eyes = _check_object_overlap(analysis["objects"]["detected"], [x, y, x2, y2])
+    analysis["objects"]["object_on_face"] = on_face
+    analysis["objects"]["object_on_eyes"] = on_eyes
 
     # ---------------- MediaPipe FaceMesh ----------------
     face_rgb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
@@ -403,13 +466,13 @@ def process_frame(frame):
         analysis["attention"]["pitch"] = round(pitch, 2)
         analysis["attention"]["roll"] = round(roll, 2)
 
-        if yaw < -18:
+        if yaw < -YAW_THRESHOLD:
             direction = "Left"
-        elif yaw > 18:
+        elif yaw > YAW_THRESHOLD:
             direction = "Right"
-        elif pitch < -15:
+        elif pitch < PITCH_UP_THRESHOLD:
             direction = "Up"
-        elif pitch > 18:
+        elif pitch > PITCH_DOWN_THRESHOLD:
             direction = "Down"
         else:
             direction = "Center"

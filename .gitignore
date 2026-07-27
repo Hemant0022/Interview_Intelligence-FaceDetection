@@ -1,2 +1,3 @@
 .venv
 facial.py
+__pycache__
